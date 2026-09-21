@@ -1,0 +1,10 @@
+[package]
+name = "agmd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+ignore = "0.4.33"
+ratatui = "0.30.2"
+regex = "1.13.1"
