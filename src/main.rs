@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -27,6 +27,9 @@ use ratatui::{
 };
 use regex::Regex;
 
+// 自动刷新间隔
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
 // ---------- 数据模型 ----------
 
 #[derive(Debug, Clone)]
@@ -38,9 +41,7 @@ struct Item {
 
 #[derive(Debug, Clone)]
 enum ItemKind {
-    /// 层级 1..=6 + 标题文本
     Heading(u8, String),
-    /// 是否完成、缩进视觉宽度、正文
     Task {
         done: bool,
         indent: usize,
@@ -60,7 +61,12 @@ fn is_markdown(path: &Path) -> bool {
     )
 }
 
-/// tab 折算为 4 空格的视觉宽度
+fn is_readme_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .map_or(false, |n| n.eq_ignore_ascii_case("README.md"))
+}
+
 fn visual_indent(s: &str) -> usize {
     s.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum()
 }
@@ -71,7 +77,13 @@ fn extract(path: &Path, content: &str, heading_re: &Regex, task_re: &Regex) -> V
         let line_no = idx + 1;
 
         if let Some(c) = heading_re.captures(line) {
-            let level = c[1].len() as u8;
+            let raw_level = c[1].len() as u8;
+            // 非 README 文件的 heading 整体下移一级，让 README 处于顶层
+            let level = if is_readme_path(path) {
+                raw_level
+            } else {
+                (raw_level + 1).min(6)
+            };
             let text = c[2].trim().to_string();
             out.push(Item {
                 path: path.to_path_buf(),
@@ -92,7 +104,21 @@ fn extract(path: &Path, content: &str, heading_re: &Regex, task_re: &Regex) -> V
     out
 }
 
-/// 扫描当前目录树。错误类型改为 String，方便跨线程传递。
+fn readme_priority(path: &Path) -> u8 {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+    if name.eq_ignore_ascii_case("README.md") {
+        // 根目录下的 README 排最前
+        if path.parent().map_or(true, |p| p.as_os_str().is_empty()) {
+            0
+        } else {
+            1
+        }
+    } else {
+        2
+    }
+}
+
 fn scan_markdown() -> Result<Vec<Item>, String> {
     let heading_re =
         Regex::new(r"^(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$").map_err(|e| e.to_string())?;
@@ -115,7 +141,6 @@ fn scan_markdown() -> Result<Vec<Item>, String> {
             continue;
         }
 
-        // 去掉开头的 "./"
         let display_path = raw.strip_prefix(".").unwrap_or(raw).to_path_buf();
 
         let content = match fs::read_to_string(raw) {
@@ -126,7 +151,13 @@ fn scan_markdown() -> Result<Vec<Item>, String> {
         items.extend(extract(&display_path, &content, &heading_re, &task_re));
     }
 
-    items.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    items.sort_by(|a, b| {
+        readme_priority(&a.path)
+            .cmp(&readme_priority(&b.path))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+
     Ok(items)
 }
 
@@ -138,10 +169,13 @@ struct App {
     status: Option<String>,
     hide_done: bool,
 
-    /// 后台扫描进行中时持有；主线程用它轮询结果
     refresh_rx: Option<Receiver<Result<Vec<Item>, String>>>,
-    /// 发起刷新时记录的 (path, line)，用于结果回来时恢复选中位置
     pending_anchor: Option<(PathBuf, usize)>,
+
+    /// 自动刷新开关
+    auto_refresh: bool,
+    /// 最近一次发起刷新的时刻（用于自动刷新的周期判断）
+    last_refresh_at: Instant,
 }
 
 impl App {
@@ -157,27 +191,69 @@ impl App {
             hide_done: false,
             refresh_rx: None,
             pending_anchor: None,
+            auto_refresh: false,
+            last_refresh_at: Instant::now(),
         }
     }
 
-    /// 当前可见项的索引（相对于 self.items）
     fn visible_indices(&self) -> Vec<usize> {
-        self.items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| {
-                if !self.hide_done {
-                    return true;
+        if !self.hide_done {
+            return (0..self.items.len()).collect();
+        }
+
+        // 计算每个 Heading 的管辖范围结束索引（不包含）
+        let mut heading_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut stack: Vec<(usize, u8)> = Vec::new();
+
+        for (i, item) in self.items.iter().enumerate() {
+            if let ItemKind::Heading(level, _) = &item.kind {
+                while let Some(&(h_idx, h_level)) = stack.last() {
+                    if h_level >= *level {
+                        stack.pop();
+                        heading_ranges.push((h_idx, i));
+                    } else {
+                        break;
+                    }
                 }
-                // 只在 hide_done 时过滤掉已完成的 task；
-                // heading、未完成的 task 都保留
-                !matches!(it.kind, ItemKind::Task { done: true, .. })
-            })
-            .map(|(i, _)| i)
-            .collect()
+                stack.push((i, *level));
+            }
+        }
+        for (h_idx, _) in stack {
+            heading_ranges.push((h_idx, self.items.len()));
+        }
+
+        // 判断每个 Heading 是否应该显示
+        // 规则：如果管辖范围内有任务，且所有任务都已完成，则隐藏该 Heading
+        let mut heading_visible: Vec<bool> = vec![true; self.items.len()];
+        for &(h_idx, end) in &heading_ranges {
+            let mut has_task = false;
+            let mut has_undone = false;
+            for j in h_idx + 1..end {
+                if let ItemKind::Task { done, .. } = &self.items[j].kind {
+                    has_task = true;
+                    if !*done {
+                        has_undone = true;
+                        break;
+                    }
+                }
+            }
+            heading_visible[h_idx] = !has_task || has_undone;
+        }
+
+        // 过滤出可见项
+        let mut result = Vec::new();
+        for (i, item) in self.items.iter().enumerate() {
+            let keep = match &item.kind {
+                ItemKind::Heading(..) => heading_visible[i],
+                ItemKind::Task { done, .. } => !*done,
+            };
+            if keep {
+                result.push(i);
+            }
+        }
+        result
     }
 
-    /// 选中项在 self.items 中的实际下标（而非可见位置）
     fn selected(&self) -> Option<&Item> {
         self.state.selected().and_then(|i| self.items.get(i))
     }
@@ -220,7 +296,6 @@ impl App {
         self.state.select(vis.last().copied());
     }
 
-    /// 按可见顺序移动 delta 步
     fn step(&mut self, delta: isize) {
         let vis = self.visible_indices();
         if vis.is_empty() {
@@ -235,7 +310,6 @@ impl App {
         self.state.select(Some(vis[new_pos]));
     }
 
-    /// 切换是否显示已完成任务
     fn toggle_hide_done(&mut self) {
         self.hide_done = !self.hide_done;
 
@@ -251,26 +325,41 @@ impl App {
         }
     }
 
-    /// 后台是否正在刷新
+    /// 切换自动刷新开关。开启时重置计时，避免刚打开就立刻触发。
+    fn toggle_auto_refresh(&mut self) {
+        self.auto_refresh = !self.auto_refresh;
+        self.last_refresh_at = Instant::now();
+    }
+
     fn is_refreshing(&self) -> bool {
         self.refresh_rx.is_some()
     }
 
-    /// 发起一次后台刷新；若已在刷新中则忽略
+    /// 若开启自动刷新且间隔已到且当前没在刷新，就发起一次后台刷新
+    fn maybe_auto_refresh(&mut self) {
+        if !self.auto_refresh || self.is_refreshing() {
+            return;
+        }
+        if self.last_refresh_at.elapsed() >= AUTO_REFRESH_INTERVAL {
+            self.start_refresh();
+        }
+    }
+
     fn start_refresh(&mut self) {
         if self.refresh_rx.is_some() {
             return;
         }
+        // 立刻重置计时，避免长扫描期间反复触发
+        self.last_refresh_at = Instant::now();
+
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            // 接收端已 drop 时 send 返回 Err，直接忽略，线程自然结束
             let _ = tx.send(scan_markdown());
         });
         self.refresh_rx = Some(rx);
         self.pending_anchor = self.selected().map(|i| (i.path.clone(), i.line));
     }
 
-    /// 非阻塞地尝试接收后台刷新结果；每次事件循环调用
     fn poll_refresh(&mut self) {
         let rx = match &self.refresh_rx {
             Some(rx) => rx,
@@ -296,7 +385,6 @@ impl App {
                 });
                 self.state.select(idx);
 
-                // 若选中项被 hide_done 过滤掉，落到第一个可见项
                 let vis = self.visible_indices();
                 if let Some(c) = self.state.selected() {
                     if !vis.contains(&c) {
@@ -313,7 +401,7 @@ impl App {
                 self.refresh_rx = None;
                 self.pending_anchor = None;
             }
-            Err(TryRecvError::Empty) => { /* 还没好 */ }
+            Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.status = Some("刷新线程意外退出".to_string());
                 self.refresh_rx = None;
@@ -355,7 +443,6 @@ fn item_to_line(item: &Item) -> Line<'static> {
                 ),
             ];
 
-            // 仅在 H1 后面追加 darkgray 的 `path:line`
             if *level == 1 {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
@@ -396,9 +483,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(1),    // list
-            Constraint::Length(1), // footer
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -462,7 +549,6 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|&i| ListItem::new(item_to_line(&app.items[i])))
         .collect();
 
-    // 把「items 下标」翻译成「可见列表下标」，避免高亮错位
     let selected_pos = app
         .state
         .selected()
@@ -487,48 +573,41 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     f.render_stateful_widget(list, area, &mut render_state);
 
-    // 把滚动位置写回 App，保证下次按键时视口延续
     *app.state.offset_mut() = render_state.offset();
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let refreshing = app.is_refreshing();
 
-    let keys = |hide_done: bool, refreshing: bool| -> Vec<Span<'static>> {
-        let d_style = if hide_done {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let r_style = if refreshing {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+    // 统一的黄色高亮样式
+    let on_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let off_style = Style::default().fg(Color::DarkGray);
+
+    let keys = |hide_done: bool, refreshing: bool, auto_refresh: bool| -> Vec<Span<'static>> {
+        let d_style = if hide_done { on_style } else { off_style };
+        let r_style = if refreshing { on_style } else { off_style };
+        let a_style = if auto_refresh { on_style } else { off_style };
+
         vec![
-            Span::styled(
-                "j/k · PgUp/PgDn · g/G · Enter 编辑 · ",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("j/k · PgUp/PgDn · g/G · Enter 编辑 · ", off_style),
             Span::styled("d 过滤", d_style),
-            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" · ", off_style),
             Span::styled("r 刷新", r_style),
-            Span::styled(" · q 退出", Style::default().fg(Color::DarkGray)),
+            Span::styled(" · ", off_style),
+            Span::styled("a 自动刷新", a_style),
+            Span::styled(" · q 退出", off_style),
         ]
     };
 
-    // status 只承载错误信息（成功路径不写 status）
     if let Some(msg) = &app.status {
         let mut spans = vec![
             Span::raw(" "),
             Span::styled(msg.clone(), Style::default().fg(Color::LightYellow)),
             Span::raw("  "),
         ];
-        spans.extend(keys(app.hide_done, refreshing));
+        spans.extend(keys(app.hide_done, refreshing, app.auto_refresh));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
@@ -541,7 +620,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw("  "),
         ];
-        spans.extend(keys(app.hide_done, refreshing));
+        spans.extend(keys(app.hide_done, refreshing, app.auto_refresh));
         Line::from(spans)
     } else {
         Line::from(Span::styled(
@@ -577,7 +656,6 @@ where
     match status {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => {
-            // nvim 正常退出但返回码非 0，不当作致命错误
             eprintln!("nvim exited with status: {s}");
             Ok(())
         }
@@ -596,11 +674,13 @@ where
     io::Error: From<B::Error>,
 {
     loop {
-        // 先吸收后台结果，再画
+        // 处理后台结果，并检查是否需要自动刷新
         app.poll_refresh();
+        app.maybe_auto_refresh();
+
         terminal.draw(|f| ui(f, &mut app))?;
 
-        // 50ms 超时：刷新时能较快看到结果；空闲时也不会太费
+        // 50ms 超时：自动刷新粒度足够细；空闲时也不会太费
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
@@ -617,6 +697,7 @@ where
                     KeyCode::PageUp => app.step(-15),
                     KeyCode::Char('d') => app.toggle_hide_done(),
                     KeyCode::Char('r') => app.start_refresh(),
+                    KeyCode::Char('a') => app.toggle_auto_refresh(),
                     KeyCode::Enter => {
                         if let Some(item) = app.selected() {
                             let path = item.path.clone();
@@ -641,7 +722,6 @@ where
 fn main() -> Result<(), Box<dyn Error>> {
     let items = scan_markdown().map_err(|e| -> Box<dyn Error> { e.into() })?;
 
-    // panic 时也要恢复终端，否则 shell 会乱掉
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
