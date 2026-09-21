@@ -127,7 +127,11 @@ fn scan_markdown() -> Result<Vec<Item>, String> {
 
     let mut items = Vec::new();
 
-    for entry in WalkBuilder::new(".").standard_filters(true).build() {
+    for entry in WalkBuilder::new(".")
+        .standard_filters(true)
+        .follow_links(true)
+        .build()
+    {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -188,7 +192,7 @@ impl App {
             items,
             state,
             status: None,
-            hide_done: false,
+            hide_done: true,
             refresh_rx: None,
             pending_anchor: None,
             auto_refresh: false,
