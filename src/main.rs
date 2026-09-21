@@ -122,8 +122,8 @@ fn readme_priority(path: &Path) -> u8 {
 fn scan_markdown() -> Result<Vec<Item>, String> {
     let heading_re =
         Regex::new(r"^(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$").map_err(|e| e.to_string())?;
-    let task_re =
-        Regex::new(r"^([ \t]*)[-*+][ \t]+\[([ xX])\][ \t]+(.*)$").map_err(|e| e.to_string())?;
+    let task_re = Regex::new(r"^([ \t]*)(?:[-*+]|\d+[.)])[ \t]+\[([ xX])\][ \t]+(.*)$")
+        .map_err(|e| e.to_string())?;
 
     let mut items = Vec::new();
 
