@@ -130,6 +130,25 @@ fn scan_markdown() -> Result<Vec<Item>, String> {
     for entry in WalkBuilder::new(".")
         .standard_filters(true)
         .follow_links(true)
+        .filter_entry(|entry| {
+            // 深度为 0 的是遍历起点（当前目录），必须保留，
+            // 否则一旦当前目录本身也在 Git 仓库里，整个遍历会直接空掉。
+            if entry.depth() == 0 {
+                return true;
+            }
+
+            // 只对目录做“Git 边界”判定
+            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                let git = entry.path().join(".git");
+                // .git 可能是目录（普通仓库 / 已展开的 submodule）
+                // 也可能是文件（submodule / worktree），两者都要视为边界
+                if git.is_dir() || git.is_file() {
+                    return false; // 跳过该子目录，不再向下遍历
+                }
+            }
+
+            true
+        })
         .build()
     {
         let entry = match entry {
