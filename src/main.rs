@@ -246,21 +246,19 @@ impl App {
         }
 
         // 判断每个 Heading 是否应该显示
-        // 规则：如果管辖范围内有任务，且所有任务都已完成，则隐藏该 Heading
+        // 规则：如果管辖范围内没有任何未完成的 task，则隐藏该 Heading
         let mut heading_visible: Vec<bool> = vec![true; self.items.len()];
         for &(h_idx, end) in &heading_ranges {
-            let mut has_task = false;
             let mut has_undone = false;
             for j in h_idx + 1..end {
                 if let ItemKind::Task { done, .. } = &self.items[j].kind {
-                    has_task = true;
                     if !*done {
                         has_undone = true;
                         break;
                     }
                 }
             }
-            heading_visible[h_idx] = !has_task || has_undone;
+            heading_visible[h_idx] = has_undone;
         }
 
         // 过滤出可见项
