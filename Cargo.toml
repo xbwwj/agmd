@@ -1,0 +1,12 @@
+[package]
+name = "agmd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4"
+crossterm = "0.29"
+ignore = "0.4"
+pulldown-cmark = "0.13"
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2"
